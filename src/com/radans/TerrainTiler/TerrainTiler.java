@@ -30,7 +30,9 @@ import com.jme3.terrain.geomipmap.NeighbourFinder;
 import com.jme3.terrain.geomipmap.TerrainQuad;
 import com.jme3.terrain.geomipmap.lodcalc.DistanceLodCalculator;
 import com.jme3.texture.plugins.AWTLoader;
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileReader;
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -48,7 +50,7 @@ import java.util.logging.Logger;
  *
  */
 public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
-    private static double version = 2013.1118;
+    private static float version = 2013.1118f;
     private static int maxTiles = 4096;
     protected static final Logger tLog = Logger.getLogger(TerrainTiler.class.getCanonicalName());
     private final DesktopAssetManager dAssetManager;
@@ -74,6 +76,8 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
     private volatile int gridCenterX;               // center of viewable grid
     private volatile int gridCenterZ;               // center of viewable grid
     private Set<TerrainTilerAction> actionHooks = new HashSet<>();
+    public boolean valid = false;                   // true if terrain initialized, false if somethings wrong;
+    public int mapVersion = 0;
 
     /**
      * Constructor for new TerrainTiler object using a 3x3 tile grid as default
@@ -81,17 +85,25 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
      *
      * @param cam - Camera to track movement for tile load/unload.
      * @param tLocator - Full pathname for the <tiledTerrain>.map file to load.
-     *          This file containes all the details on the map tiles, size etc
-     *          Should be absolute path and filename for loading.
+     *      This file containes all the details on the map tiles, size etc
+     *      Should be absolute path and filename for loading.
+     *      line 1: tiledTerrain : <version>          // eg "tiledTerrain : 19
+     *      line 2: useJars   : <true|false>          // are tiles packed into jars
+     *      line 3: numTilesX : <16...4096>           // number tiles in X direction
+     *      line 4: numTilesZ : <16...4096>           // number tiles in Z direction
+     *      line 5: tileSize  : <256...2048>          // base size of each tile
+     *      line 6: tileScale : <scale>               // scale factors for each tile
+     *      line 7: tileType  : <image|terrain|node>  // tile file type
      * @param caller - SimpleApplication calling us to attach appState to
      */
-    public TerrainTiler(Camera cam, String tLocator, SimpleApplication caller) throws IOException {
+    public TerrainTiler(Camera cam, String tLocator, SimpleApplication caller) {
         this.setName("TiledTerrainNode");
         this.camera = cam;
         this.app = caller;
         this.terrainLocked = true;      // by default lock out editing
         this.gridSize = 3;              // default to 3x3 grid
         this.terrainMapFile = tLocator;
+        this.valid = false;
         
         dAssetManager = new DesktopAssetManager();
         dAssetManager.registerLocator("/", ClasspathLocator.class);
@@ -105,21 +117,86 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
         dAssetManager.registerLoader(AWTLoader.class, "png");
         
         // todo
-        /** load in <tiledTerrain>.map file and parse parameters....
-         * .map file structure (plain text):
-         * line 1: tiledTerrain : <version>         // eg "tiledTerrain : 19
-         * line 2: useJars : <true|false>           // 
-         * line 3: numTilesX : <16...4096>          // number tiles in X direction
-         * line 4: numTilesZ : <16...4096>          // number tiles in Z direction
-         * line 5: tileSize : <256...2048>          // base size of each tile
-         * line 6: tileType : <image|terrain|node>  // tile file type
-         * lines 7+: other fields used only by the editor.
-         */
+        /** load in <tiledTerrain>.map file and parse parameters....*/
         File file = new File(tLocator);
-        terrainMapFile = file.getCanonicalPath();
-        tileLocator = file.getParentFile().getCanonicalPath();
-        
-        
+        if (file.exists()) {
+            try {
+                tileLocator = file.getParentFile().getCanonicalPath();
+                FileReader fRead = new FileReader(file);
+                BufferedReader bRead = new BufferedReader(fRead);
+                String rLine = bRead.readLine();
+                if (rLine.startsWith("tiledTerrain")) {
+                    mapVersion = Integer.valueOf(rLine.substring(15));
+                    rLine = bRead.readLine();
+                    useJars = Boolean.valueOf(rLine.substring(12));
+                    rLine = bRead.readLine();
+                    numTilesX = Integer.valueOf(rLine.substring(12));
+                    rLine = bRead.readLine();
+                    numTilesZ = Integer.valueOf(rLine.substring(12));
+                    rLine = bRead.readLine();
+                    tileSize = Integer.valueOf(rLine.substring(12));
+                    rLine = bRead.readLine();
+                    tileScale = Integer.valueOf(rLine.substring(12));
+                    rLine = bRead.readLine();
+                    if (rLine.substring(12).startsWith("terrain")) {
+                        this.valid = true;
+                        if (numTilesX < 16 | numTilesX > 4096 | numTilesZ < 16 | numTilesZ > 4096) {
+                            this.valid = false;
+                        }
+                        if (tileSize != 256 & tileSize != 512 & tileSize != 1024 & tileSize != 2048) {
+                            this.valid = false;
+                        }
+                        if (tileScale == 0) {
+                            this.valid = false;
+                        }
+                    }
+                    bRead.close();
+                    fRead.close();
+                }
+            } catch (IOException ex) {
+                Logger.getLogger(TerrainTiler.class.getName()).log(Level.SEVERE, "Error loading tiledTerrain.map {0}", ex);
+            }
+        }
+        if (!this.valid) {
+            Logger.getLogger(TerrainTiler.class.getName()).log(Level.SEVERE, "Cannot initialize tiledTerrain - tiledTerrain.map file does not exist at given location.");
+            return;
+        }
+        // we have a valid mapfile - initialise the tiledterrain
+        if (!this.useJars) {
+            dAssetManager.registerLocator(tileLocator, FileLocator.class);
+        } else {
+            for (int z = 0; z < (numTilesZ / 64) + 1; z++) {
+                for (int x = 0; x < (numTilesX / 64 + 1); x++) {
+                    String jarFile = String.format("DIR-%02d%02d.jar", x, z);
+                    tLog.log(Level.FINE, "Registering jar file: {0}{1}", new Object[]{tileLocator, jarFile});
+                    dAssetManager.registerLocator(tileLocator + jarFile, ZipLocator.class);
+                }
+            }
+        }
+        // Check tile size by loading the origin one.
+        TerrainQuad tq = LoadTile(0, 0);
+        if (tq.getName().startsWith("OOB")) {
+            tLog.log(Level.SEVERE, "TerrainTiler: Origin Tile Not Found! Aborting...");
+            this.valid = false;
+            return;
+        }
+        if (this.tileSize != (tq.getTerrainSize() - 1)) {
+            tLog.log(Level.SEVERE, "TerrainTiler: Origin Tile size does not match mapfile! Aborting...");
+            this.valid = false;
+            return;
+        }
+        this.tileWSize = tileSize * tileScale;
+        int pSize = tileSize / 4;
+
+        // setup LOD system
+        terrainMLOD = new MultiTerrainLodControl(camera);
+        terrainMLOD.setLodCalculator(new DistanceLodCalculator(pSize + 1, 2.0f));
+        this.addControl(terrainMLOD);
+
+        // initialize our appState and attach it
+        terrainState = new TerrainState();
+        terrainState.initialize(app.getStateManager(), app);
+        app.getStateManager().attach(terrainState);
     }
     
     /**
@@ -127,7 +204,7 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
      * manual way with no map file - restricted as follows:
      *
      * @param cam - Camera to track movement for tile load/unload.
-     * @param nTiles - Max number of tiles in the X & Z axis
+     * @param nTiles - Max number of tiles in the X & Z axis ( X==Z )
      * @param uJars - Boolean true if tiles are packed into jars
      * @param tScale - scale to apply to each tile to world size
      * @param tLocator - Tile Locator - root directory for tile subfolders. -
@@ -144,6 +221,7 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
         this.useJars = uJars;
         this.tileScale = tScale;
         this.tileLocator = tLocator;
+        this.valid = false;
         this.app = caller;
         this.gridSize = 3;              // default to 3x3 grid
         this.terrainLocked = useJars;
@@ -191,6 +269,7 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
         terrainState = new TerrainState();
         terrainState.initialize(app.getStateManager(), app);
         app.getStateManager().attach(terrainState);
+        this.valid = true;
     }
 
     /**
@@ -208,8 +287,7 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
 
             ModelKey mk = new ModelKey(dirName + tileName);
             TerrainQuad tq = (TerrainQuad) dAssetManager.loadModel(mk);
-            dAssetManager.deleteFromCache(mk);
-
+            
             tq.setLocalScale(tileScale, 1f, tileScale);
             float ts = tileSize * tileScale;
             float to = ts / 2;
@@ -223,6 +301,7 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
             //tq.getMaterial().getAdditionalRenderState().setWireframe(true);
 
             tLog.log(Level.FINE, "Tile Loaded");
+            dAssetManager.deleteFromCache(mk);
             return tq;
         } catch (Exception ex) {
             tLog.log(Level.WARNING, "Error loading tile!{0}", ex.getMessage());
@@ -387,6 +466,15 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
      */
     public void setEnabled(boolean state) {
         terrainState.setEnabled(state);
+    }
+    
+    /**
+     * Get the terrainState isEnabled state
+     * 
+     * @return true|false
+     */
+    public boolean getEnabled() {
+        return terrainState.isEnabled();
     }
 
     /**
@@ -835,7 +923,7 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
                         }
                     }
                     firstRun = false;
-                }
+                }/*
                 time = System.nanoTime() - time;
                 time /= 1000000;
                 if (time > 90) {
@@ -846,7 +934,7 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
                 } catch (InterruptedException ex) {
                     tLog.log(Level.SEVERE, null, ex);
                     threadState = false;
-                }
+                }*/
             }
             // thread has been stopped so flag all tiles for removal
             Iterator it = tileFlag.keySet().iterator();
@@ -897,6 +985,11 @@ public class TerrainTiler extends Node implements Terrain, NeighbourFinder {
                     tileFlag.remove(key);
                 }
                 tileSet.clear();
+                tileFlag.clear();
+                while (tThread.isAlive()){
+                    // wait for thread to stop.
+                }
+                TerrainTiler.this.detachAllChildren();
                 isEnable = false;
             }
         }
